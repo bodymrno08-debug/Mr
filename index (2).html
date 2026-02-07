@@ -1,0 +1,565 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>3D Hand-Controlled Particle System</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body,html{width:100%;height:100%;overflow:hidden;background:#000;font-family:'Segoe UI',sans-serif;touch-action:none}
+#container{width:100%;height:100%;position:relative}
+#glCanvas{display:block;width:100%;height:100%;position:absolute;top:0;left:0;z-index:1}
+#video{position:absolute;top:10px;right:10px;width:120px;height:90px;border-radius:10px;border:2px solid rgba(255,255,255,0.3);z-index:10;object-fit:cover;transform:scaleX(-1);opacity:0.8}
+#handOverlay{position:absolute;top:10px;right:10px;width:120px;height:90px;border-radius:10px;z-index:11;pointer-events:none}
+#ui{position:absolute;bottom:10px;left:50%;transform:translateX(-50%);display:flex;gap:6px;flex-wrap:wrap;justify-content:center;z-index:10;padding:8px;background:rgba(0,0,0,0.5);border-radius:16px;max-width:95%}
+.btn{padding:6px 12px;border:none;border-radius:12px;background:rgba(255,255,255,0.15);color:#fff;font-size:13px;cursor:pointer;backdrop-filter:blur(4px);transition:all .2s;user-select:none;-webkit-tap-highlight-color:transparent}
+.btn:hover,.btn.active{background:rgba(255,255,255,0.35);transform:scale(1.05)}
+#info{position:absolute;top:10px;left:10px;color:rgba(255,255,255,0.85);font-size:12px;z-index:10;background:rgba(0,0,0,0.5);padding:8px 12px;border-radius:10px;max-width:200px;line-height:1.4}
+#handStatus{position:absolute;top:110px;right:10px;color:#0f0;font-size:11px;z-index:12;background:rgba(0,0,0,0.6);padding:4px 8px;border-radius:6px;text-align:center;width:120px}
+#gesture{position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);color:rgba(255,255,255,0.6);font-size:28px;z-index:10;pointer-events:none;text-shadow:0 0 20px rgba(255,255,255,0.3);transition:opacity 0.5s;opacity:0}
+</style>
+</head>
+<body>
+<div id="container">
+<canvas id="glCanvas"></canvas>
+<video id="video" autoplay playsinline muted></video>
+<canvas id="handOverlay"></canvas>
+<div id="info">
+✋ Show hand to camera<br>
+👆 Point → Attract particles<br>
+✊ Fist → Compress<br>
+🖐 Open → Expand<br>
+✌️ Peace → Next shape<br>
+👍 Thumb → Color shift
+</div>
+<div id="handStatus">📷 Starting camera...</div>
+<div id="gesture"></div>
+<div id="ui">
+<button class="btn active" data-shape="heart">❤️ Heart</button>
+<button class="btn" data-shape="flower">🌸 Flower</button>
+<button class="btn" data-shape="saturn">🪐 Saturn</button>
+<button class="btn" data-shape="firework">🎆 Firework</button>
+<button class="btn" data-shape="star">⭐ Star</button>
+<button class="btn" data-shape="spiral">🌀 Spiral</button>
+<button class="btn" data-shape="dna">🧬 DNA</button>
+<button class="btn" data-shape="cube">🔲 Cube</button>
+</div>
+</div>
+
+<script>
+// ============ HAND TRACKING via camera ============
+const video = document.getElementById('video');
+const handOverlay = document.getElementById('handOverlay');
+const hCtx = handOverlay.getContext('2d');
+const handStatus = document.getElementById('handStatus');
+const gestureDisplay = document.getElementById('gesture');
+
+let handData = { x: 0, y: 0, active: false, gesture: 'none', fingerCount: 0, spread: 0 };
+let prevSkinRatio = 0;
+let gestureTimeout = null;
+let skinCalibration = null;
+let calibrationFrames = 0;
+let avgSkinH = 15, avgSkinS = 50;
+
+// Camera setup
+async function startCamera() {
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({
+      video: { facingMode: 'user', width: { ideal: 320 }, height: { ideal: 240 } }
+    });
+    video.srcObject = stream;
+    video.onloadedmetadata = () => {
+      video.play();
+      handOverlay.width = video.videoWidth || 320;
+      handOverlay.height = video.videoHeight || 240;
+      handStatus.textContent = '✅ Camera active';
+      handStatus.style.color = '#0f0';
+      requestAnimationFrame(processFrame);
+    };
+  } catch(e) {
+    handStatus.textContent = '❌ No camera - use touch';
+    handStatus.style.color = '#f55';
+    console.log('Camera error:', e);
+  }
+}
+
+// Skin detection via HSV color space
+function rgbToHsv(r, g, b) {
+  r /= 255; g /= 255; b /= 255;
+  const max = Math.max(r, g, b), min = Math.min(r, g, b);
+  const d = max - min;
+  let h = 0, s = max === 0 ? 0 : d / max, v = max;
+  if (d !== 0) {
+    if (max === r) h = ((g - b) / d + 6) % 6;
+    else if (max === g) h = (b - r) / d + 2;
+    else h = (r - g) / d + 4;
+    h *= 60;
+  }
+  return [h, s * 100, v * 100];
+}
+
+function isSkinPixel(r, g, b) {
+  const [h, s, v] = rgbToHsv(r, g, b);
+  // Broad skin detection
+  return (h >= 0 && h <= 50) && (s >= 15 && s <= 75) && (v >= 25 && v <= 95)
+    && (r > 60) && (g > 40) && (b > 20) && (r > g) && (r > b) && (Math.abs(r - g) > 10);
+}
+
+function processFrame() {
+  if (video.readyState < 2) { requestAnimationFrame(processFrame); return; }
+
+  const w = handOverlay.width, h = handOverlay.height;
+  hCtx.drawImage(video, 0, 0, w, h);
+  const imageData = hCtx.getImageData(0, 0, w, h);
+  const data = imageData.data;
+
+  // Skin mask
+  let skinPixels = [];
+  let totalSkin = 0;
+  let sumX = 0, sumY = 0;
+  let minX = w, maxX = 0, minY = h, maxY = 0;
+  const step = 2; // Sample every 2 pixels for speed
+
+  for (let y = 0; y < h; y += step) {
+    for (let x = 0; x < w; x += step) {
+      const i = (y * w + x) * 4;
+      if (isSkinPixel(data[i], data[i+1], data[i+2])) {
+        totalSkin++;
+        sumX += x; sumY += y;
+        if (x < minX) minX = x; if (x > maxX) maxX = x;
+        if (y < minY) minY = y; if (y > maxY) maxY = y;
+        skinPixels.push(x, y);
+      }
+    }
+  }
+
+  const skinRatio = totalSkin / ((w / step) * (h / step));
+
+  // Clear overlay and draw hand markers
+  hCtx.clearRect(0, 0, w, h);
+  hCtx.drawImage(video, 0, 0, w, h);
+
+  if (totalSkin > 50 && skinRatio > 0.02 && skinRatio < 0.7) {
+    const cx = sumX / totalSkin;
+    const cy = sumY / totalSkin;
+    const bboxW = maxX - minX;
+    const bboxH = maxY - minY;
+
+    // Map to normalized coords (-1 to 1), mirrored
+    handData.x = -(cx / w - 0.5) * 2;
+    handData.y = -(cy / h - 0.5) * 2;
+    handData.active = true;
+    handData.spread = Math.max(bboxW, bboxH) / Math.max(w, h);
+
+    // Gesture detection based on skin blob shape analysis
+    const aspectRatio = bboxW / (bboxH || 1);
+    const fillRatio = totalSkin / ((bboxW / step) * (bboxH / step) || 1);
+    const blobSize = skinRatio;
+
+    // Analyze top region for finger detection
+    let topSkin = 0, bottomSkin = 0;
+    const midY = (minY + maxY) / 2;
+    for (let i = 0; i < skinPixels.length; i += 2) {
+      if (skinPixels[i + 1] < midY) topSkin++;
+      else bottomSkin++;
+    }
+    const topRatio = topSkin / (totalSkin || 1);
+
+    // Count vertical runs (finger-like protrusions) in top 30%
+    const scanY = minY + bboxH * 0.2;
+    let fingerRuns = 0;
+    let inSkin = false;
+    for (let x = minX; x <= maxX; x += step) {
+      const i = (Math.floor(scanY) * w + x) * 4;
+      const sk = isSkinPixel(data[i], data[i+1], data[i+2]);
+      if (sk && !inSkin) { fingerRuns++; inSkin = true; }
+      else if (!sk) inSkin = false;
+    }
+
+    // Gesture classification
+    let newGesture = 'open';
+    if (fillRatio > 0.7 && aspectRatio > 0.6 && aspectRatio < 1.6) {
+      newGesture = 'fist'; // Compact blob = fist
+    } else if (fingerRuns >= 4 && blobSize > 0.05) {
+      newGesture = 'open'; // Spread fingers
+    } else if (fingerRuns === 1 && fillRatio < 0.5) {
+      newGesture = 'point'; // Single protrusion
+    } else if (fingerRuns === 2 && fillRatio < 0.55) {
+      newGesture = 'peace'; // Two protrusions
+    } else if (aspectRatio > 1.5 && fillRatio < 0.5) {
+      newGesture = 'thumb'; // Wide, sparse
+    } else if (blobSize > 0.1) {
+      newGesture = 'open';
+    }
+
+    // Smooth gesture (require consistent detection)
+    if (newGesture !== handData.gesture) {
+      if (!handData._pendingGesture || handData._pendingGesture !== newGesture) {
+        handData._pendingGesture = newGesture;
+        handData._pendingCount = 0;
+      }
+      handData._pendingCount++;
+      if (handData._pendingCount > 5) {
+        handData.gesture = newGesture;
+        showGesture(newGesture);
+      }
+    }
+
+    handData.fingerCount = fingerRuns;
+
+    // Draw visual feedback on overlay
+    hCtx.strokeStyle = '#0f0';
+    hCtx.lineWidth = 2;
+    hCtx.strokeRect(minX, minY, bboxW, bboxH);
+    hCtx.fillStyle = '#0f0';
+    hCtx.beginPath();
+    hCtx.arc(cx, cy, 5, 0, Math.PI * 2);
+    hCtx.fill();
+    hCtx.fillStyle = '#fff';
+    hCtx.font = '10px sans-serif';
+    hCtx.fillText(handData.gesture, minX, minY - 4);
+
+    handStatus.textContent = `✋ ${handData.gesture} (${fingerRuns}f)`;
+    handStatus.style.color = '#0f0';
+  } else {
+    handData.active = false;
+    handData.gesture = 'none';
+    handStatus.textContent = '👀 Show hand...';
+    handStatus.style.color = '#ff0';
+  }
+
+  prevSkinRatio = skinRatio;
+  requestAnimationFrame(processFrame);
+}
+
+const gestureEmojis = { fist: '✊', open: '🖐️', point: '👆', peace: '✌️', thumb: '👍', none: '' };
+let lastShapeSwitch = 0;
+const shapes = ['heart','flower','saturn','firework','star','spiral','dna','cube'];
+let shapeIndex = 0;
+
+function showGesture(g) {
+  gestureDisplay.textContent = gestureEmojis[g] || '';
+  gestureDisplay.style.opacity = 1;
+  clearTimeout(gestureTimeout);
+  gestureTimeout = setTimeout(() => { gestureDisplay.style.opacity = 0; }, 1000);
+
+  // Peace sign switches shape
+  if (g === 'peace' && Date.now() - lastShapeSwitch > 1500) {
+    lastShapeSwitch = Date.now();
+    shapeIndex = (shapeIndex + 1) % shapes.length;
+    switchShape(shapes[shapeIndex]);
+  }
+}
+
+// ============ WebGL PARTICLE SYSTEM ============
+const glCanvas = document.getElementById('glCanvas');
+const gl2 = glCanvas.getContext('webgl', { alpha: true, antialias: false }) || glCanvas.getContext('experimental-webgl');
+
+function resize() {
+  glCanvas.width = window.innerWidth;
+  glCanvas.height = window.innerHeight;
+  if (gl2) gl2.viewport(0, 0, glCanvas.width, glCanvas.height);
+}
+window.addEventListener('resize', resize);
+resize();
+
+const PCOUNT = 3000;
+let curPos = new Float32Array(PCOUNT * 3);
+let tgtPos = new Float32Array(PCOUNT * 3);
+let vel = new Float32Array(PCOUNT * 3);
+let col = new Float32Array(PCOUNT * 3);
+let tgtCol = new Float32Array(PCOUNT * 3);
+let pSize = new Float32Array(PCOUNT);
+let time2 = 0;
+let expansion = 1.0;
+let colorShift = 0;
+
+// Shaders
+const vsSrc = `
+attribute vec3 aPos;
+attribute vec3 aCol;
+attribute float aSize;
+uniform mat4 uP, uMV;
+uniform float uTime;
+varying vec3 vC;
+varying float vA;
+void main(){
+  vC = aCol;
+  vec4 mv = uMV * vec4(aPos, 1.0);
+  gl_Position = uP * mv;
+  float d = length(mv.xyz);
+  gl_PointSize = clamp(aSize * 250.0 / d, 1.0, 50.0);
+  vA = smoothstep(25.0, 1.0, d) * 0.95;
+}`;
+const fsSrc = `
+precision mediump float;
+varying vec3 vC;
+varying float vA;
+void main(){
+  vec2 c = gl_PointCoord - 0.5;
+  float d = length(c);
+  if(d > 0.5) discard;
+  float a = smoothstep(0.5, 0.05, d) * vA;
+  vec3 glow = vC * (1.0 + 0.5 * (1.0 - d*2.0));
+  gl_FragColor = vec4(glow, a);
+}`;
+
+function mkShader(t, s) {
+  const sh = gl2.createShader(t);
+  gl2.shaderSource(sh, s);
+  gl2.compileShader(sh);
+  if (!gl2.getShaderParameter(sh, gl2.COMPILE_STATUS)) console.error(gl2.getShaderInfoLog(sh));
+  return sh;
+}
+
+const prg = gl2.createProgram();
+gl2.attachShader(prg, mkShader(gl2.VERTEX_SHADER, vsSrc));
+gl2.attachShader(prg, mkShader(gl2.FRAGMENT_SHADER, fsSrc));
+gl2.linkProgram(prg);
+gl2.useProgram(prg);
+
+const lPos = gl2.getAttribLocation(prg, 'aPos');
+const lCol = gl2.getAttribLocation(prg, 'aCol');
+const lSiz = gl2.getAttribLocation(prg, 'aSize');
+const uP = gl2.getUniformLocation(prg, 'uP');
+const uMV = gl2.getUniformLocation(prg, 'uMV');
+const uT = gl2.getUniformLocation(prg, 'uTime');
+
+const bPos = gl2.createBuffer(), bCol = gl2.createBuffer(), bSiz = gl2.createBuffer();
+
+gl2.enable(gl2.BLEND);
+gl2.blendFunc(gl2.SRC_ALPHA, gl2.ONE);
+gl2.disable(gl2.DEPTH_TEST);
+
+// Matrix math
+function persp(f, a, n, fa) {
+  const t = 1/Math.tan(f/2), nf = 1/(n-fa);
+  return new Float32Array([t/a,0,0,0, 0,t,0,0, 0,0,(fa+n)*nf,-1, 0,0,2*fa*n*nf,0]);
+}
+function mul(a, b) {
+  const r = new Float32Array(16);
+  for(let i=0;i<4;i++) for(let j=0;j<4;j++){r[j*4+i]=0;for(let k=0;k<4;k++)r[j*4+i]+=a[k*4+i]*b[j*4+k];}
+  return r;
+}
+function rotY(m,a){const c=Math.cos(a),s=Math.sin(a);return mul(m,new Float32Array([c,0,s,0,0,1,0,0,-s,0,c,0,0,0,0,1]));}
+function rotX(m,a){const c=Math.cos(a),s=Math.sin(a);return mul(m,new Float32Array([1,0,0,0,0,c,-s,0,0,s,c,0,0,0,0,1]));}
+function trans(m,x,y,z){return mul(m,new Float32Array([1,0,0,0,0,1,0,0,0,0,1,0,x,y,z,1]));}
+
+// Shape generators
+function hsl2rgb(h,s,l){h%=360;const c=(1-Math.abs(2*l-1))*s,x=c*(1-Math.abs((h/60)%2-1)),m=l-c/2;let r=0,g=0,b=0;if(h<60){r=c;g=x}else if(h<120){r=x;g=c}else if(h<180){g=c;b=x}else if(h<240){g=x;b=c}else if(h<300){r=x;b=c}else{r=c;b=x}return[r+m,g+m,b+m];}
+
+const generators = {
+  heart(i,n){const t=i/n*Math.PI*2,x=16*Math.pow(Math.sin(t),3),y=13*Math.cos(t)-5*Math.cos(2*t)-2*Math.cos(3*t)-Math.cos(4*t);return[x*.17+(Math.random()-.5)*.4,y*.17+(Math.random()-.5)*.4,(Math.random()-.5)*1.5];},
+  flower(i,n){const t=i/n*Math.PI*12,r=2.5*Math.cos(2.5*t)+Math.random()*.5;return[r*Math.cos(t),r*Math.sin(t),(Math.random()-.5)*1.2];},
+  saturn(i,n){if(i<n*.6){const p=Math.acos(2*Math.random()-1),t=Math.random()*6.28,r=1.5;return[r*Math.sin(p)*Math.cos(t),r*Math.sin(p)*Math.sin(t),r*Math.cos(p)];}const t=Math.random()*6.28,r=2.5+Math.random();return[r*Math.cos(t),(Math.random()-.5)*.15,r*Math.sin(t)];},
+  firework(i,n){const p=Math.acos(2*Math.random()-1),t=Math.random()*6.28,b=Math.floor(Math.random()*5),r=(1.2+b*.5)*(0.8+Math.random()*.4);return[r*Math.sin(p)*Math.cos(t)+(b-2)*.8,r*Math.sin(p)*Math.sin(t)+b*.3-.5,r*Math.cos(p)];},
+  star(i,n){const t=i/n*6.28,r=(i%2?1:2.8)*(0.8+Math.random()*.4);return[r*Math.cos(t),r*Math.sin(t),(Math.random()-.5)*1.2];},
+  spiral(i,n){const t=i/n*25,r=t*.2;return[r*Math.cos(t)*.5,(i/n-.5)*7,r*Math.sin(t)*.5];},
+  dna(i,n){const t=i/n*18,y=(i/n-.5)*8,s=i%2,r=1.5;return[r*Math.cos(t+s*3.14)+(Math.random()-.5)*.2,y,r*Math.sin(t+s*3.14)+(Math.random()-.5)*.2];},
+  cube(i,n){const f=Math.floor(Math.random()*6),s=2,u=(Math.random()-.5)*2*s,v=(Math.random()-.5)*2*s;const faces=[[s,u,v],[-s,u,v],[u,s,v],[u,-s,v],[u,v,s],[u,v,-s]];return faces[f];}
+};
+
+const colorSchemes = {
+  heart:()=>{const r=Math.random();return[.9+r*.1,.1+r*.3,.2+r*.2];},
+  flower:()=>hsl2rgb(Math.random()*360,.7,.6),
+  saturn:()=>{const r=Math.random();return[.8+r*.2,.7+r*.2,.4+r*.3];},
+  firework:()=>hsl2rgb(Math.random()*360,1,.6),
+  star:()=>{const r=Math.random();return[1,.8+r*.2,.2+r*.4];},
+  spiral:()=>hsl2rgb(200+Math.random()*160,.8,.55),
+  dna:()=>Math.random()>.5?[.2,.7+Math.random()*.3,1]:[1,.3,.4+Math.random()*.3],
+  cube:()=>hsl2rgb(Math.random()*60+180,.7,.55)
+};
+
+let currentShape = 'heart';
+function genShape(shape) {
+  const gen = generators[shape], colGen = colorSchemes[shape];
+  for(let i=0;i<PCOUNT;i++){
+    const p = gen(i, PCOUNT);
+    tgtPos[i*3]=p[0]; tgtPos[i*3+1]=p[1]; tgtPos[i*3+2]=p[2];
+    const c = colGen();
+    tgtCol[i*3]=c[0]; tgtCol[i*3+1]=c[1]; tgtCol[i*3+2]=c[2];
+    pSize[i] = 1.0 + Math.random() * 2.0;
+  }
+}
+
+function switchShape(shape) {
+  currentShape = shape;
+  genShape(shape);
+  document.querySelectorAll('.btn').forEach(b => b.classList.toggle('active', b.dataset.shape === shape));
+  shapeIndex = shapes.indexOf(shape);
+}
+
+// Init particles
+for(let i=0;i<PCOUNT*3;i++){curPos[i]=(Math.random()-.5)*10;vel[i]=0;col[i]=1;}
+genShape('heart');
+
+// Button handlers
+document.querySelectorAll('.btn').forEach(b => {
+  b.addEventListener('click', () => switchShape(b.dataset.shape));
+  b.addEventListener('touchstart', (e) => { e.preventDefault(); switchShape(b.dataset.shape); });
+});
+
+// Touch fallback
+let touchActive = false, touchX = 0, touchY = 0;
+glCanvas.addEventListener('touchstart', e => { e.preventDefault(); touchActive = true; const t = e.touches[0]; touchX = (t.clientX/window.innerWidth-.5)*2; touchY = -(t.clientY/window.innerHeight-.5)*2; });
+glCanvas.addEventListener('touchmove', e => { e.preventDefault(); const t = e.touches[0]; touchX = (t.clientX/window.innerWidth-.5)*2; touchY = -(t.clientY/window.innerHeight-.5)*2; });
+glCanvas.addEventListener('touchend', () => touchActive = false);
+glCanvas.addEventListener('mousedown', e => { touchActive = true; touchX = (e.clientX/window.innerWidth-.5)*2; touchY = -(e.clientY/window.innerHeight-.5)*2; });
+glCanvas.addEventListener('mousemove', e => { if(touchActive){ touchX = (e.clientX/window.innerWidth-.5)*2; touchY = -(e.clientY/window.innerHeight-.5)*2; }});
+glCanvas.addEventListener('mouseup', () => touchActive = false);
+
+let rotAY = 0, rotAX = 0;
+
+function animate() {
+  time2 += 0.016;
+
+  // Determine control source
+  let ctrlX = 0, ctrlY = 0, ctrlActive = false;
+  let gestureExpansion = 1.0;
+  let attractForce = 0;
+  let doColorShift = false;
+
+  if (handData.active) {
+    ctrlX = handData.x;
+    ctrlY = handData.y;
+    ctrlActive = true;
+
+    switch(handData.gesture) {
+      case 'fist':
+        gestureExpansion = 0.3;
+        break;
+      case 'open':
+        gestureExpansion = 1.5 + handData.spread * 2;
+        break;
+      case 'point':
+        attractForce = 2.0;
+        break;
+      case 'thumb':
+        doColorShift = true;
+        break;
+    }
+  } else if (touchActive) {
+    ctrlX = touchX;
+    ctrlY = touchY;
+    ctrlActive = true;
+    attractForce = 1.5;
+  }
+
+  // Smooth expansion
+  expansion += (gestureExpansion - expansion) * 0.05;
+
+  // Color shift from thumb gesture
+  if (doColorShift) colorShift += 0.02;
+
+  // Auto rotation, influenced by hand position
+  rotAY += 0.008 + (ctrlActive ? ctrlX * 0.02 : 0);
+  rotAX += (ctrlActive ? ctrlY * 0.01 : 0);
+  rotAX *= 0.95;
+
+  // Update particles
+  for(let i = 0; i < PCOUNT; i++) {
+    const i3 = i * 3;
+    let tx = tgtPos[i3] * expansion;
+    let ty = tgtPos[i3+1] * expansion;
+    let tz = tgtPos[i3+2] * expansion;
+
+    // Attractor from hand/touch
+    if (ctrlActive && attractForce > 0) {
+      const ax = ctrlX * 5;
+      const ay = ctrlY * 5;
+      const dx = ax - curPos[i3];
+      const dy = ay - curPos[i3+1];
+      const dz = -curPos[i3+2];
+      const dist = Math.sqrt(dx*dx + dy*dy + dz*dz) + 0.1;
+      const f = attractForce / (dist * dist + 1) * 0.3;
+      vel[i3] += dx * f;
+      vel[i3+1] += dy * f;
+      vel[i3+2] += dz * f;
+    }
+
+    // Repulsion from fist
+    if (handData.active && handData.gesture === 'fist') {
+      const ax = ctrlX * 5;
+      const ay = ctrlY * 5;
+      const dx = curPos[i3] - ax;
+      const dy = curPos[i3+1] - ay;
+      const dz = curPos[i3+2];
+      const dist = Math.sqrt(dx*dx + dy*dy + dz*dz) + 0.1;
+      if (dist < 4) {
+        const f = 0.15 / (dist + 0.5);
+        vel[i3] += dx * f;
+        vel[i3+1] += dy * f;
+        vel[i3+2] += dz * f;
+      }
+    }
+
+    // Spring to target
+    vel[i3] += (tx - curPos[i3]) * 0.02;
+    vel[i3+1] += (ty - curPos[i3+1]) * 0.02;
+    vel[i3+2] += (tz - curPos[i3+2]) * 0.02;
+
+    // Damping
+    vel[i3] *= 0.92; vel[i3+1] *= 0.92; vel[i3+2] *= 0.92;
+
+    // Integrate
+    curPos[i3] += vel[i3];
+    curPos[i3+1] += vel[i3+1];
+    curPos[i3+2] += vel[i3+2];
+
+    // Color interpolation with shift
+    let tr = tgtCol[i3], tg = tgtCol[i3+1], tb = tgtCol[i3+2];
+    if (colorShift > 0) {
+      const shifted = hsl2rgb((colorShift * 100 + i * 0.1) % 360, 0.8, 0.6);
+      tr = shifted[0]; tg = shifted[1]; tb = shifted[2];
+    }
+    col[i3] += (tr - col[i3]) * 0.05;
+    col[i3+1] += (tg - col[i3+1]) * 0.05;
+    col[i3+2] += (tb - col[i3+2]) * 0.05;
+
+    // Breathing size
+    pSize[i] = 1.0 + Math.sin(time2 * 2 + i * 0.01) * 0.5 + (ctrlActive ? 0.5 : 0);
+  }
+
+  // Render
+  gl2.clearColor(0, 0, 0, 1);
+  gl2.clear(gl2.COLOR_BUFFER_BIT);
+
+  const aspect = glCanvas.width / glCanvas.height;
+  const proj = persp(Math.PI / 3, aspect, 0.1, 100);
+  let mv = new Float32Array([1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1]);
+  mv = trans(mv, 0, 0, -10);
+  mv = rotX(mv, rotAX);
+  mv = rotY(mv, rotAY);
+
+  gl2.uniformMatrix4fv(uP, false, proj);
+  gl2.uniformMatrix4fv(uMV, false, mv);
+  gl2.uniform1f(uT, time2);
+
+  // Upload positions
+  gl2.bindBuffer(gl2.ARRAY_BUFFER, bPos);
+  gl2.bufferData(gl2.ARRAY_BUFFER, curPos, gl2.DYNAMIC_DRAW);
+  gl2.enableVertexAttribArray(lPos);
+  gl2.vertexAttribPointer(lPos, 3, gl2.FLOAT, false, 0, 0);
+
+  // Upload colors
+  gl2.bindBuffer(gl2.ARRAY_BUFFER, bCol);
+  gl2.bufferData(gl2.ARRAY_BUFFER, col, gl2.DYNAMIC_DRAW);
+  gl2.enableVertexAttribArray(lCol);
+  gl2.vertexAttribPointer(lCol, 3, gl2.FLOAT, false, 0, 0);
+
+  // Upload sizes
+  gl2.bindBuffer(gl2.ARRAY_BUFFER, bSiz);
+  gl2.bufferData(gl2.ARRAY_BUFFER, pSize, gl2.DYNAMIC_DRAW);
+  gl2.enableVertexAttribArray(lSiz);
+  gl2.vertexAttribPointer(lSiz, 1, gl2.FLOAT, false, 0, 0);
+
+  gl2.drawArrays(gl2.POINTS, 0, PCOUNT);
+
+  requestAnimationFrame(animate);
+}
+
+startCamera();
+animate();
+</script>
+</body>
+</html>
